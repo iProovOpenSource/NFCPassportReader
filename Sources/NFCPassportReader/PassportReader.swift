@@ -62,6 +62,7 @@ public class PassportReader : NSObject {
     private var paceHandler : PACEHandler?
     private var mrzKey : String = ""
     private var dataAmountToReadOverride : Int? = nil
+    private var challenge: [UInt8]? = nil
     
     private var scanCompletedHandler: ((NFCPassportModel?, NFCPassportReaderError?)->())!
     private var nfcViewDisplayMessageHandler: ((NFCViewDisplayMessage) -> String?)?
@@ -90,10 +91,11 @@ public class PassportReader : NSObject {
         dataAmountToReadOverride = amount
     }
     
-    public func readPassport( mrzKey : String, tags : [DataGroupId] = [], skipSecureElements : Bool = true, skipCA : Bool = false, skipPACE : Bool = false, useExtendedMode : Bool = false, customDisplayMessage : ((NFCViewDisplayMessage) -> String?)? = nil) async throws -> NFCPassportModel {
+    public func readPassport( mrzKey : String, tags : [DataGroupId] = [], skipSecureElements : Bool = true, challenge: [UInt8]? = nil, skipCA : Bool = false, skipPACE : Bool = false, useExtendedMode : Bool = false, customDisplayMessage : ((NFCViewDisplayMessage) -> String?)? = nil) async throws -> NFCPassportModel {
         
         self.passport = NFCPassportModel()
         self.mrzKey = mrzKey
+        self.challenge = challenge
         self.skipCA = skipCA
         self.skipPACE = skipPACE
         self.useExtendedMode = useExtendedMode
@@ -302,7 +304,12 @@ extension PassportReader {
         // Now to read the datagroups
         try await readDataGroups(tagReader: tagReader)
 
-        try await doActiveAuthenticationIfNeccessary(tagReader : tagReader)
+        var useExtendedModeOverride: Bool = false
+        if let dg15 = self.passport.getDataGroup(.DG15) {
+            useExtendedModeOverride = self.shouldUseExtendedMode(for: Data(dg15.body))
+        }
+        
+        try await doActiveAuthenticationIfNeccessary(tagReader : tagReader, useExtendedModeOverride: useExtendedModeOverride)
 
         self.updateReaderSessionMessage(alertMessage: NFCViewDisplayMessage.successfulRead)
         self.shouldNotReportNextReaderSessionInvalidationErrorUserCanceled = true
@@ -314,8 +321,31 @@ extension PassportReader {
         return self.passport
     }
     
+    public func shouldUseExtendedMode(for dg15: Data) -> Bool {
+        // Step 1 & 2: Determine key type (RSA or EC)
+        let ecKeyIdentifier = "2A8648CE3D0201"
+        let rsaKeyIdentifier = "2A864886F70D010101"
+        
+        let dg15HexString = dg15.toHexString()
+        
+        // Check hex string length (25 bytes * 2 characters per byte)
+        if dg15HexString.count < 50 {
+            return false
+        }
+        
+        if dg15HexString.contains(ecKeyIdentifier) {
+           return false // EC keys don't need extended mode
+        } else if dg15HexString.contains(rsaKeyIdentifier) {
+           // Step 3: Check DG15 length for RSA keys
+           return dg15HexString.count >= 560 // 280 bytes * 2 characters per byte
+        } else {
+           // Handle invalid key types if necessary
+           return false
+        }
+    }
     
-    func doActiveAuthenticationIfNeccessary( tagReader : TagReader) async throws {
+    
+    func doActiveAuthenticationIfNeccessary( tagReader : TagReader, useExtendedModeOverride: Bool) async throws {
         guard self.passport.activeAuthenticationSupported else {
             return
         }
@@ -323,9 +353,10 @@ extension PassportReader {
 
         Logger.passportReader.info( "Performing Active Authentication" )
 
-        let challenge = generateRandomUInt8Array(8)
-        Logger.passportReader.debug( "Generated Active Authentication challange - \(binToHexRep(challenge))")
-        let response = try await tagReader.doInternalAuthentication(challenge: challenge, useExtendedMode: useExtendedMode)
+        let challenge =  self.challenge ?? generateRandomUInt8Array(8)
+        Logger.passportReader.debug( "Active Authentication challange - \(binToHexRep(challenge))")
+        
+        let response = try await tagReader.doInternalAuthentication(challenge: challenge, useExtendedMode: useExtendedModeOverride || useExtendedMode)
         self.passport.verifyActiveAuthentication( challenge:challenge, signature:response.data )
     }
     
@@ -479,3 +510,9 @@ extension PassportReader {
     }
 }
 #endif
+
+extension Data {
+    func toHexString() -> String {
+        return self.map { String(format: "%02hhX", $0) }.joined()
+    }
+}
